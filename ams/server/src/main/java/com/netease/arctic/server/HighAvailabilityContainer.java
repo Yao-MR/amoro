@@ -22,6 +22,8 @@ import com.alibaba.fastjson.JSONObject;
 import com.netease.arctic.ams.api.client.AmsServerInfo;
 import com.netease.arctic.ams.api.properties.AmsHAProperties;
 import com.netease.arctic.server.utils.Configurations;
+import io.javalin.Javalin;
+import io.javalin.http.HandlerType;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
@@ -32,6 +34,7 @@ import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
@@ -39,21 +42,28 @@ import java.util.concurrent.CountDownLatch;
 public class HighAvailabilityContainer implements LeaderLatchListener {
 
   public static final Logger LOG = LoggerFactory.getLogger(HighAvailabilityContainer.class);
+  private static final String TARGET_URL_FORMAT = "http://%s:%d";
 
   private final LeaderLatch leaderLatch;
   private final CuratorFramework zkClient;
+  private final Integer masterPort;
   private final String tableServiceMasterPath;
   private final String optimizingServiceMasterPath;
   private final AmsServerInfo tableServiceServerInfo;
   private final AmsServerInfo optimizingServiceServerInfo;
+  private final Javalin dispatcherServer;
   private transient CountDownLatch followerLath;
+
+  private String masterHost;
 
   public HighAvailabilityContainer(Configurations serviceConfig) throws Exception {
     if (serviceConfig.getBoolean(ArcticManagementConf.HA_ENABLE)) {
       String zkServerAddress = serviceConfig.getString(ArcticManagementConf.HA_ZOOKEEPER_ADDRESS);
       String haClusterName = serviceConfig.getString(ArcticManagementConf.HA_CLUSTER_NAME);
+      masterPort = serviceConfig.getInteger(ArcticManagementConf.TABLE_SERVICE_THRIFT_BIND_PORT);
       tableServiceMasterPath = AmsHAProperties.getTableServiceMasterPath(haClusterName);
       optimizingServiceMasterPath = AmsHAProperties.getOptimizingServiceMasterPath(haClusterName);
+      dispatcherServer = Javalin.create(config -> config.showJavalinBanner = false);
       ExponentialBackoffRetry retryPolicy = new ExponentialBackoffRetry(1000, 3, 5000);
       this.zkClient =
           CuratorFrameworkFactory.builder()
@@ -81,10 +91,12 @@ public class HighAvailabilityContainer implements LeaderLatchListener {
     } else {
       leaderLatch = null;
       zkClient = null;
+      masterPort = null;
       tableServiceMasterPath = null;
       optimizingServiceMasterPath = null;
       tableServiceServerInfo = null;
       optimizingServiceServerInfo = null;
+      dispatcherServer = null;
       // block follower latch forever when ha is disabled
       followerLath = new CountDownLatch(1);
     }
@@ -137,6 +149,7 @@ public class HighAvailabilityContainer implements LeaderLatchListener {
         tableServiceServerInfo.toString(),
         optimizingServiceServerInfo.toString());
     followerLath = new CountDownLatch(1);
+    syncMasterAddress();
   }
 
   @Override
@@ -146,6 +159,19 @@ public class HighAvailabilityContainer implements LeaderLatchListener {
         tableServiceServerInfo.toString(),
         optimizingServiceServerInfo.toString());
     followerLath.countDown();
+    syncMasterAddress();
+  }
+
+  public void initDispatcher() {
+    if (dispatcherServer == null) {
+      dispatcherServer.addHandler(HandlerType.GET, "/", ctx -> {
+        HttpServletResponse response = ctx.res;
+        response.setHeader(
+            "Location", String.format(TARGET_URL_FORMAT, masterHost, masterPort));
+        response.setStatus(302);
+      });
+      dispatcherServer.start(masterPort);
+    }
   }
 
   private AmsServerInfo buildServerInfo(String host, int port) {
@@ -155,6 +181,18 @@ public class HighAvailabilityContainer implements LeaderLatchListener {
     return amsServerInfo;
   }
 
+  private void syncMasterAddress() {
+    try {
+      AmsServerInfo amsServerInfo =
+          JSONObject.parseObject(
+              zkClient.getData().forPath(tableServiceMasterPath), AmsServerInfo.class);
+      this.masterHost = amsServerInfo.getHost();
+      initDispatcher();
+      LOG.info("Sync the master address: {} for dispatch. ", masterHost);
+    } catch (Exception e) {
+      LOG.error("Error happen when sync the master address. ", e);
+    }
+  }
   private void createPathIfNeeded(String path) throws Exception {
     try {
       zkClient.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(path);
